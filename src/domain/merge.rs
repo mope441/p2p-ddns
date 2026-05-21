@@ -39,8 +39,12 @@ pub fn merge_node(existing: Option<&Node>, incoming: &Node) -> (Node, bool) {
     match existing {
         None => (incoming.clone(), true),
         Some(existing) => {
-            let addr = merge_addr(&existing.addr, &incoming.addr);
             let should_take_incoming = incoming.last_heartbeat > existing.last_heartbeat;
+            let addr = if should_take_incoming && has_ip_addr(&incoming.addr) {
+                incoming.addr.clone()
+            } else {
+                merge_addr(&existing.addr, &incoming.addr)
+            };
 
             let merged = if should_take_incoming {
                 Node {

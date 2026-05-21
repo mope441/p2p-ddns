@@ -16,7 +16,9 @@ use dashmap::DashMap;
 use futures::{FutureExt, StreamExt, TryStreamExt, channel::mpsc::Receiver};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey,
+    TransportAddr, Watcher,
     discovery::{UserData, mdns::MdnsDiscovery, static_provider::StaticProvider},
+    endpoint::ConnectionType,
     protocol::{Router, RouterBuilder},
 };
 use iroh_gossip::{
@@ -68,6 +70,18 @@ pub struct Context {
     join_announced: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     hosts_sync: Arc<RwLock<HostsSyncStatus>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifyStatus {
+    trusted: bool,
+    fresh: bool,
+}
+
+impl VerifyStatus {
+    fn passed(self) -> bool {
+        self.trusted && self.fresh
+    }
 }
 
 pub(crate) fn should_filter_advertised_addrs(args: &DaemonArgs) -> bool {
@@ -604,18 +618,53 @@ impl Context {
         }
     }
 
-    fn decode_and_verify(&self, bytes: Bytes) -> Result<(PublicKey, Message, bool)> {
+    fn decode_and_verify(&self, bytes: Bytes) -> Result<(PublicKey, Message, VerifyStatus)> {
         let signed = SignedMessage::decode(bytes)?;
         let (from, message) = signed.verify_and_decode_message()?;
-        let passed = self.is_node_trusted(&from) && signed.is_fresh(time_now());
-        Ok((from, message, passed))
+        let status = VerifyStatus {
+            trusted: self.is_node_trusted(&from),
+            fresh: signed.is_fresh(time_now()),
+        };
+        Ok((from, message, status))
     }
 
-    fn merge_existing_addr(&self, node_id: &EndpointId, incoming: EndpointAddr) -> EndpointAddr {
-        self.nodes
-            .get(node_id)
-            .map(|node| merge::merge_addr(&node.addr, &incoming))
-            .unwrap_or(incoming)
+    fn observed_direct_addr(&self, node_id: EndpointId) -> Option<EndpointAddr> {
+        let mut conn_type = self.handle.conn_type(node_id)?;
+        let addr = match conn_type.get() {
+            ConnectionType::Direct(addr) | ConnectionType::Mixed(addr, _) => addr,
+            ConnectionType::Relay(_) | ConnectionType::None => return None,
+        };
+        Some(EndpointAddr::from_parts(node_id, [TransportAddr::Ip(addr)]))
+    }
+
+    fn sender_message_addr(&self, node_id: EndpointId, addr: EndpointAddr) -> EndpointAddr {
+        let addr = if addr.id == node_id {
+            addr
+        } else {
+            EndpointAddr::new(node_id)
+        };
+
+        self.observed_direct_addr(node_id).unwrap_or(addr)
+    }
+
+    fn refresh_sender_observed_addr(&self, node_id: EndpointId) -> bool {
+        let Some(addr) = self.observed_direct_addr(node_id) else {
+            return false;
+        };
+        let Some(existing) = self.nodes.get(&node_id).map(|it| it.value().clone()) else {
+            return false;
+        };
+
+        let merged = Node {
+            addr,
+            last_heartbeat: time_now(),
+            ..existing
+        };
+        if self.is_node_trusted(&node_id) && is_daemon_node(&merged) {
+            self.trusted_nodes.insert(node_id, merged.clone());
+        }
+        self.upsert_active_node(merged);
+        true
     }
 
     pub(crate) fn trust_daemon_node(&self, node: &Node) {
@@ -763,9 +812,9 @@ impl Context {
                 bmsg = sp_recv.next().fuse() => {
                     match bmsg {
                         Some(bmsg) => {
-                            if let Ok((from, msg, passed)) = self.decode_and_verify(bmsg) {
+                            if let Ok((from, msg, status)) = self.decode_and_verify(bmsg) {
                                 log::debug!("Received p2p msg: {:?}", msg);
-                                self.process_message(from, msg, passed).await;
+                                self.process_message(from, msg, status).await;
                             } else {
                                 log::error!("Failed to decode and verify message from p2p");
                             }
@@ -816,8 +865,8 @@ impl Context {
                 }
                 bmsg = sp_recv.next() => {
                     if let Some(bmsg) = bmsg {
-                        if let Ok((from, msg, passed)) = self.decode_and_verify(bmsg) {
-                            self.process_message(from, msg, passed).await;
+                        if let Ok((from, msg, status)) = self.decode_and_verify(bmsg) {
+                            self.process_message(from, msg, status).await;
                         }
                     } else {
                         break;
@@ -932,8 +981,8 @@ impl Context {
             Ok(Some(evt)) => match evt {
                 Event::NeighborDown(_endpoint_id) => {}
                 Event::Received(msg) => {
-                    if let Ok((from, message, passed)) = self.decode_and_verify(msg.content) {
-                        self.process_message(from, message, passed).await;
+                    if let Ok((from, message, status)) = self.decode_and_verify(msg.content) {
+                        self.process_message(from, message, status).await;
                     }
                 }
                 Event::Lagged => log::warn!("Gossip receiver lagged; consider restarting it"),
@@ -946,11 +995,15 @@ impl Context {
         }
     }
 
-    async fn process_message(&self, from: EndpointId, message: Message, passed: bool) {
+    async fn process_message(&self, from: EndpointId, message: Message, status: VerifyStatus) {
         log::debug!("Received message from {:?}", from);
         log::debug!("Message: {:?}", message);
 
-        if passed && let Some(mut node) = self.nodes.get_mut(&from) {
+        let passed = status.passed();
+        if passed
+            && !self.refresh_sender_observed_addr(from)
+            && let Some(mut node) = self.nodes.get_mut(&from)
+        {
             node.last_heartbeat = time_now();
         }
 
@@ -963,6 +1016,11 @@ impl Context {
                 services,
                 invitor,
             } => {
+                if !status.fresh {
+                    log::warn!("Ignoring stale Invited message from {:?}", from);
+                    return;
+                }
+
                 if !self.ticket.validate(topic, rnum) {
                     log::error!("Received untrusted Invited message from {:?}", from);
                     return;
@@ -970,14 +1028,9 @@ impl Context {
                     log::info!("Trusting node: {:?} for it holds our ticket", from);
                 }
 
-                let addr = if addr.id == from {
-                    addr
-                } else {
-                    EndpointAddr::new(from)
-                };
-                let addr = self.merge_existing_addr(&from, addr);
+                let addr = self.sender_message_addr(from, addr);
 
-                let node = Node {
+                let incoming = Node {
                     node_id: from,
                     invitor,
                     addr,
@@ -985,6 +1038,8 @@ impl Context {
                     services,
                     last_heartbeat: time_now(),
                 };
+                let existing = self.nodes.get(&from).map(|it| it.value().clone());
+                let (node, _) = merge::merge_node(existing.as_ref(), &incoming);
 
                 self.trust_daemon_node(&node);
                 self.upsert_active_node(node);
@@ -1001,14 +1056,9 @@ impl Context {
                     return;
                 }
 
-                let addr = if addr.id == from {
-                    addr
-                } else {
-                    EndpointAddr::new(from)
-                };
-                let addr = self.merge_existing_addr(&from, addr);
+                let addr = self.sender_message_addr(from, addr);
 
-                let node = Node {
+                let incoming = Node {
                     node_id: from,
                     invitor,
                     addr,
@@ -1016,6 +1066,8 @@ impl Context {
                     services,
                     last_heartbeat: time_now(),
                 };
+                let existing = self.nodes.get(&from).map(|it| it.value().clone());
+                let (node, _) = merge::merge_node(existing.as_ref(), &incoming);
                 self.trust_daemon_node(&node);
                 self.upsert_active_node(node);
             }
@@ -1037,9 +1089,12 @@ impl Context {
             }
             Message::SyncRequest { nodes } => {
                 if !self.args.daemon || passed {
-                    for node in nodes {
+                    for mut node in nodes {
                         if node.node_id == self.me.node_id || !is_daemon_node(&node) {
                             continue;
+                        }
+                        if node.node_id == from {
+                            node.addr = self.sender_message_addr(from, node.addr);
                         }
                         let existing = self.nodes.get(&node.node_id).map(|it| it.value().clone());
                         let should_update = match existing.as_ref() {
@@ -1073,9 +1128,12 @@ impl Context {
                 // A message from a trusted node is always valid.
                 // Or if we are a client, we simply trust everything.
                 if !self.args.daemon || passed {
-                    for node in nodes {
+                    for mut node in nodes {
                         if node.node_id == self.me.node_id || !is_daemon_node(&node) {
                             continue;
+                        }
+                        if node.node_id == from {
+                            node.addr = self.sender_message_addr(from, node.addr);
                         }
                         let existing = self.nodes.get(&node.node_id).map(|it| it.value().clone());
                         let should_update = match existing.as_ref() {
@@ -1166,4 +1224,58 @@ fn hosts_sync_path(args: &DaemonArgs) -> Option<PathBuf> {
             .ok()
             .or_else(|| Some(PathBuf::from("/etc/hosts")))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_invited_does_not_trust_or_activate_node() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let args = DaemonArgs {
+            daemon: false,
+            primary: true,
+            domain: Some("primary".to_string()),
+            config: Some(dir.path().to_path_buf()),
+            bind: Some("127.0.0.1:0".to_string()),
+            no_mdns: true,
+            dht: false,
+            ..DaemonArgs::default()
+        };
+        DaemonArgs::validate(&args)?;
+
+        let storage = Storage::new(dir.path().join("storage.db"))?;
+        let (ctx, _gos, _sp) = init_network(args, storage).await?;
+
+        let mut rng = rand::rng();
+        let peer_sk = SecretKey::generate(&mut rng);
+        let peer_id = peer_sk.public();
+        let stale_timestamp = time_now().saturating_sub(3600);
+        let encoded = SignedMessage::sign_and_encode_at(
+            &peer_sk,
+            Message::Invited {
+                topic: ctx.ticket.topic(),
+                rnum: ctx.ticket.rnum(),
+                addr: EndpointAddr::new(peer_id),
+                alias: "peer".to_string(),
+                services: BTreeMap::new(),
+                invitor: ctx.me.node_id,
+            },
+            stale_timestamp,
+        )?;
+
+        let (from, message, status) = ctx.decode_and_verify(encoded)?;
+        assert_eq!(from, peer_id);
+        assert!(!status.passed());
+        assert!(!status.fresh);
+
+        ctx.process_message(from, message, status).await;
+
+        assert!(!ctx.nodes.contains_key(&peer_id));
+        assert!(!ctx.is_node_trusted(&peer_id));
+        Ok(())
+    }
 }
