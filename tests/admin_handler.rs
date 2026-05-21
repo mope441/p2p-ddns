@@ -175,6 +175,7 @@ async fn add_node_and_remove_node_persist_and_update_state() -> Result<()> {
     let outcome = handler::handle_command(&ClientCommand::AddNode { ticket }, &ctx, &clients).await;
     assert!(matches!(outcome.response, ClientResponse::Ack(_)));
     assert!(ctx.nodes.contains_key(&pk));
+    assert!(ctx.is_node_trusted(&pk));
 
     let outcome = handler::handle_command(
         &ClientCommand::RemoveNode { id: pk.to_string() },
@@ -184,6 +185,39 @@ async fn add_node_and_remove_node_persist_and_update_state() -> Result<()> {
     .await;
     assert!(matches!(outcome.response, ClientResponse::Ack(_)));
     assert!(!ctx.nodes.contains_key(&pk));
+    assert!(!ctx.is_node_trusted(&pk));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn remove_node_prefix_can_revoke_inactive_trusted_node() -> Result<()> {
+    let (ctx, clients) = make_context().await?;
+
+    let mut rng = rand::rng();
+    let pk = SecretKey::generate(&mut rng).public();
+    let node = Node {
+        node_id: pk,
+        invitor: pk,
+        addr: iroh::EndpointAddr::new(pk),
+        domain: "inactive".to_string(),
+        services: Default::default(),
+        last_heartbeat: 1,
+    };
+
+    let ticket = Ticket::new(Some(ctx.ticket.topic()), node).to_string();
+    let outcome = handler::handle_command(&ClientCommand::AddNode { ticket }, &ctx, &clients).await;
+    assert!(matches!(outcome.response, ClientResponse::Ack(_)));
+    assert!(ctx.is_node_trusted(&pk));
+
+    ctx.nodes.remove(&pk);
+    let prefix = pk.to_string().chars().take(12).collect::<String>();
+    let outcome =
+        handler::handle_command(&ClientCommand::RemoveNode { id: prefix }, &ctx, &clients).await;
+
+    assert!(matches!(outcome.response, ClientResponse::Ack(_)));
+    assert!(!ctx.nodes.contains_key(&pk));
+    assert!(!ctx.is_node_trusted(&pk));
 
     Ok(())
 }

@@ -60,6 +60,7 @@ pub struct Context {
     pub single_point: P2Protocol,
     pub ticket: Ticket,
     pub nodes: DashMap<EndpointId, Node>,
+    trusted_nodes: DashMap<EndpointId, Node>,
     pub me: Arc<Node>,
     pub sender: GossipSender,
     pub args: DaemonArgs,
@@ -71,6 +72,10 @@ pub struct Context {
 
 pub(crate) fn should_filter_advertised_addrs(args: &DaemonArgs) -> bool {
     args.bind.is_none() && args.bind_interface.is_none()
+}
+
+fn is_daemon_node(node: &Node) -> bool {
+    !node.services.contains_key(SERVICE_MARKER_CLIENT)
 }
 
 fn advertised_endpoint_addr(addr: &EndpointAddr, args: &DaemonArgs) -> EndpointAddr {
@@ -393,9 +398,16 @@ fallback attempts: {:#?}",
     // They should be updated with discoveries.
     // Priority:
     // mdns discovery -> Ticket -> static discovery(inherited from storage)
-    let bootstrap_nodes = storage
-        .load_nodes::<Vec<_>>()?
+    let persisted_nodes = storage.load_nodes::<Vec<_>>()?;
+    let trusted_nodes = persisted_nodes
+        .iter()
+        .filter(|node| is_daemon_node(node) && node.node_id != pk)
+        .cloned()
+        .map(|node| (node.node_id, node))
+        .collect::<DashMap<EndpointId, Node>>();
+    let bootstrap_nodes = persisted_nodes
         .into_iter()
+        .filter(|node| is_daemon_node(node) && node.node_id != pk)
         .map(|node| (node.node_id, node))
         .collect::<DashMap<EndpointId, Node>>();
 
@@ -416,6 +428,9 @@ fallback attempts: {:#?}",
     if let Some(node) = invitor_node {
         if !node.addr.is_empty() {
             sp.set_endpoint_info(node.addr.clone());
+        }
+        if is_daemon_node(&node) && node.node_id != pk {
+            trusted_nodes.insert(node.node_id, node.clone());
         }
         bootstrap_nodes.insert(node.node_id, node);
     }
@@ -486,6 +501,7 @@ fallback attempts: {:#?}",
         single_point: p2p,
         ticket,
         nodes: bootstrap_nodes,
+        trusted_nodes,
         me: Arc::new(me),
         sender,
         args,
@@ -600,6 +616,48 @@ impl Context {
             .get(node_id)
             .map(|node| merge::merge_addr(&node.addr, &incoming))
             .unwrap_or(incoming)
+    }
+
+    pub(crate) fn trust_daemon_node(&self, node: &Node) {
+        if node.node_id == self.me.node_id || !is_daemon_node(node) {
+            return;
+        }
+
+        let existing = self
+            .trusted_nodes
+            .get(&node.node_id)
+            .map(|it| it.value().clone());
+        let (merged, _) = merge::merge_node(existing.as_ref(), node);
+        self.trusted_nodes.insert(merged.node_id, merged);
+    }
+
+    pub(crate) fn untrust_node(&self, node_id: &EndpointId) {
+        self.trusted_nodes.remove(node_id);
+    }
+
+    pub(crate) fn trusted_node_ids_with_prefix(&self, prefix: &str) -> Vec<EndpointId> {
+        self.trusted_nodes
+            .iter()
+            .filter(|node| node.key().to_string().to_lowercase().starts_with(prefix))
+            .map(|node| *node.key())
+            .collect()
+    }
+
+    pub(crate) fn trusted_node_domain(&self, node_id: &EndpointId) -> Option<String> {
+        self.trusted_nodes
+            .get(node_id)
+            .map(|node| node.value().domain.clone())
+    }
+
+    pub(crate) fn upsert_active_node(&self, node: Node) {
+        if node.node_id == self.me.node_id {
+            return;
+        }
+
+        if !node.addr.is_empty() {
+            self.static_provider.add_endpoint_info(node.addr.clone());
+        }
+        self.nodes.insert(node.node_id, node);
     }
 
     async fn announce_join(&self) {
@@ -793,12 +851,15 @@ impl Context {
     }
 
     pub async fn save(&self) -> Result<()> {
-        self.nodes.remove(&self.me.node_id);
-
-        log::debug!("Saving {} nodes to storage", self.nodes.len());
+        log::debug!(
+            "Saving {} trusted nodes to storage",
+            self.trusted_nodes.len()
+        );
         let nodes = self
-            .nodes
+            .trusted_nodes
             .iter()
+            .filter(|it| it.key() != &self.me.node_id)
+            .filter(|it| is_daemon_node(it.value()))
             .map(|it| it.value().clone())
             .collect::<Vec<_>>();
         self.storage.batch_save_nodes(nodes.into_iter())?;
@@ -889,11 +950,8 @@ impl Context {
         log::debug!("Received message from {:?}", from);
         log::debug!("Message: {:?}", message);
 
-        if passed {
-            self.nodes.alter(&from, |_, mut node| {
-                node.last_heartbeat = time_now();
-                node
-            });
+        if passed && let Some(mut node) = self.nodes.get_mut(&from) {
+            node.last_heartbeat = time_now();
         }
 
         match message {
@@ -928,10 +986,8 @@ impl Context {
                     last_heartbeat: time_now(),
                 };
 
-                self.nodes.insert(from, node);
-                if let Some(node) = self.nodes.get(&from) {
-                    self.static_provider.add_endpoint_info(node.addr.clone());
-                }
+                self.trust_daemon_node(&node);
+                self.upsert_active_node(node);
                 log::info!("Node {} joined the chat", from);
             }
             Message::AboutMe {
@@ -952,22 +1008,16 @@ impl Context {
                 };
                 let addr = self.merge_existing_addr(&from, addr);
 
-                if self.nodes.contains_key(&from) {
-                    let node = Node {
-                        node_id: from,
-                        invitor,
-                        addr,
-                        domain: alias,
-                        services,
-                        last_heartbeat: time_now(),
-                    };
-                    self.nodes.insert(from, node);
-                    if let Some(node) = self.nodes.get(&from) {
-                        self.static_provider.add_endpoint_info(node.addr.clone());
-                    }
-                } else {
-                    log::warn!("Ignoring AboutMe for unknown node {:?}", from);
-                }
+                let node = Node {
+                    node_id: from,
+                    invitor,
+                    addr,
+                    domain: alias,
+                    services,
+                    last_heartbeat: time_now(),
+                };
+                self.trust_daemon_node(&node);
+                self.upsert_active_node(node);
             }
             Message::Introduce { invited } => {
                 log::debug!(
@@ -988,6 +1038,9 @@ impl Context {
             Message::SyncRequest { nodes } => {
                 if !self.args.daemon || passed {
                     for node in nodes {
+                        if node.node_id == self.me.node_id || !is_daemon_node(&node) {
+                            continue;
+                        }
                         let existing = self.nodes.get(&node.node_id).map(|it| it.value().clone());
                         let should_update = match existing.as_ref() {
                             None => true,
@@ -995,8 +1048,8 @@ impl Context {
                         };
                         if should_update {
                             let (merged, _) = merge::merge_node(existing.as_ref(), &node);
-                            self.static_provider.add_endpoint_info(merged.addr.clone());
-                            self.nodes.insert(merged.node_id, merged);
+                            self.trust_daemon_node(&merged);
+                            self.upsert_active_node(merged);
                         }
                     }
                 }
@@ -1005,6 +1058,7 @@ impl Context {
                     let nodes = self
                         .nodes
                         .iter()
+                        .filter(|t| is_daemon_node(t.value()))
                         .map(|t| t.value().clone())
                         .chain([self.current_node_state()])
                         .collect::<Vec<_>>();
@@ -1020,6 +1074,9 @@ impl Context {
                 // Or if we are a client, we simply trust everything.
                 if !self.args.daemon || passed {
                     for node in nodes {
+                        if node.node_id == self.me.node_id || !is_daemon_node(&node) {
+                            continue;
+                        }
                         let existing = self.nodes.get(&node.node_id).map(|it| it.value().clone());
                         let should_update = match existing.as_ref() {
                             None => true,
@@ -1027,8 +1084,8 @@ impl Context {
                         };
                         if should_update {
                             let (merged, _) = merge::merge_node(existing.as_ref(), &node);
-                            self.static_provider.add_endpoint_info(merged.addr.clone());
-                            self.nodes.insert(merged.node_id, merged);
+                            self.trust_daemon_node(&merged);
+                            self.upsert_active_node(merged);
                         }
                     }
                 }
@@ -1083,7 +1140,7 @@ impl Context {
     }
 
     pub fn is_node_trusted(&self, id: &EndpointId) -> bool {
-        self.nodes.contains_key(id)
+        self.trusted_nodes.contains_key(id)
     }
 
     pub fn is_paused(&self) -> bool {

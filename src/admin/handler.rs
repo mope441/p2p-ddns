@@ -178,8 +178,8 @@ pub async fn handle_command(
             }
 
             let domain = node.domain.clone();
-            ctx.static_provider.add_endpoint_info(node.addr.clone());
-            ctx.nodes.insert(node.node_id, node.clone());
+            ctx.trust_daemon_node(&node);
+            ctx.upsert_active_node(node.clone());
             if let Err(e) = ctx.storage.save_node(&node) {
                 return CommandOutcome {
                     response: ClientResponse::Error(format!("Failed to persist node: {e}")),
@@ -198,13 +198,18 @@ pub async fn handle_command(
                 Err(_) => {
                     // Prefix matching: find nodes whose ID string starts with the given prefix
                     let prefix = id.to_lowercase();
-                    let matches: Vec<EndpointId> = ctx
+                    let mut matches: Vec<EndpointId> = ctx
                         .nodes
                         .iter()
                         .filter(|e| !clients.is_client_node(e.key()))
                         .filter(|e| e.key().to_string().to_lowercase().starts_with(&prefix))
                         .map(|e| *e.key())
                         .collect();
+                    for trusted_id in ctx.trusted_node_ids_with_prefix(&prefix) {
+                        if !matches.contains(&trusted_id) {
+                            matches.push(trusted_id);
+                        }
+                    }
 
                     match matches.len() {
                         0 => {
@@ -237,9 +242,14 @@ pub async fn handle_command(
                 };
             }
 
-            let domain = ctx.nodes.get(&node_id).map(|n| n.value().domain.clone());
+            let domain = ctx
+                .nodes
+                .get(&node_id)
+                .map(|n| n.value().domain.clone())
+                .or_else(|| ctx.trusted_node_domain(&node_id));
             clients.remove_client(&node_id);
             ctx.nodes.remove(&node_id);
+            ctx.untrust_node(&node_id);
             if let Err(e) = ctx.storage.remove_node(&node_id) {
                 return CommandOutcome {
                     response: ClientResponse::Error(format!("Failed to remove from storage: {e}")),

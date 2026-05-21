@@ -159,6 +159,35 @@ mod tests {
     }
 
     #[test]
+    fn merge_node_replaces_prior_dhcp_ip_when_newer_update_has_ip() {
+        let mut rng = rand::rng();
+        let sk = SecretKey::generate(&mut rng);
+        let pk = sk.public();
+
+        let old_ip: SocketAddr = "10.0.0.20:7777".parse().unwrap();
+        let new_ip: SocketAddr = "10.0.0.37:7777".parse().unwrap();
+
+        let mut existing = node_with_addr(
+            EndpointAddr::from_parts(pk, [TransportAddr::Ip(old_ip)]),
+            10,
+        );
+        existing.node_id = pk;
+
+        let mut incoming = existing.clone();
+        incoming.addr = EndpointAddr::from_parts(pk, [TransportAddr::Ip(new_ip)]);
+        incoming.last_heartbeat = 20;
+
+        let (merged, _) = merge_node(Some(&existing), &incoming);
+        let ips = merged.addr.ip_addrs().copied().collect::<Vec<_>>();
+
+        assert!(
+            !ips.contains(&old_ip),
+            "newer DHCP address update should replace the old IP instead of keeping it"
+        );
+        assert!(ips.contains(&new_ip));
+    }
+
+    #[test]
     fn ids_to_remove_for_duplicate_domains_removes_older() {
         let mut rng = rand::rng();
         let pk1 = SecretKey::generate(&mut rng).public();
