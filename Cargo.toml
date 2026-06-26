@@ -1,0 +1,51 @@
+[package]
+name = "p2p-ddns"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Enable publishing/looking up addresses via iroh's PKARR/DHT discovery (uses external network).
+pkarr-dht = ["iroh/discovery-pkarr-dht"]
+
+[dependencies]
+anyhow = "1.0.97"
+base64 = "0.22.1"
+bytes = "1.10.1"
+clap = { version = "4.5.32", features = ["derive"] }
+comfy-table = "7"
+crossterm = "0.29"
+dashmap = "6.1.0"
+dirs = "6.0.0"
+iroh = { version = "0.95.1", default-features = false, features = ["discovery-local-network"] }
+iroh-gossip = "0.95.0"
+log = "0.4.26"
+parking_lot = "0.12.3"
+postcard = "1.1.1"
+rand = "0.9"
+redb = "2.4.0"
+serde = "1.0.219"
+serde_json = "1"
+tokio = { version = "1.48", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+futures = "0.3.31"
+netdev = "0.38.2"
+
+[dev-dependencies]
+tempfile = "3.19.0"
+testcontainers = "0.25.0"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "s"
+panic = "abort"
+strip = "symbols"

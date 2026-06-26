@@ -1,0 +1,19 @@
+.idea/
+.vscode/
+.cargo/
+.claude/
+
+/target
+/dist
+
+# Local test artifacts (ad-hoc scripts)
+test-data/
+test-logs/
+test-run/
+test-run2/
+
+# Integration test artifacts (generated)
+tests/integration/logs/
+tests/integration/reports/
+tests/integration/volumes/
+tests/integration/test-data/
