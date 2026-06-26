@@ -72,5 +72,6 @@ pub struct JoinTicket {
     pub p2p_ticket: String,
     pub transport_port: u16,
     pub shared_secret: String,
+    pub display_name: String,
     pub expires_at: u64,
 }

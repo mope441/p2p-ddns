@@ -22,8 +22,9 @@ pub struct Node {
     pub domain: String,
     pub services: BTreeMap<String, u32>,
     pub last_heartbeat: u64,
-    /// 节点在教学场景中的角色。向后兼容：旧数据反序列化时默认为 None。
-    #[serde(default)]
+    /// 教学角色不在 Node 中持久化，仅存于 ClassMember。
+    /// 保留此字段以兼容旧 DB 数据（反序列化时忽略，不序列化）。
+    #[serde(skip)]
     pub role: Option<NodeRole>,
 }
 

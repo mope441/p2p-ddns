@@ -100,8 +100,7 @@ async fn handle_connection(
                 return write_response(stream, 403, "application/postcard", &resp_body).await;
             }
 
-            let outcome =
-                handler::handle_command(&req.command, ctx, clients, Some(client_id)).await;
+            let outcome = handler::handle_command(&req.command, ctx, clients).await;
             let resp_body = postcard::to_stdvec(&outcome.response)?;
             write_response(stream, 200, "application/postcard", &resp_body).await?;
 

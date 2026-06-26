@@ -206,7 +206,6 @@ async fn set_service_propagates_to_joined_peer_promptly() -> Result<()> {
         },
         &ctx_b,
         &clients,
-        None,
     )
     .await;
     assert!(matches!(

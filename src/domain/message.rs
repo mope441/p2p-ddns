@@ -46,6 +46,13 @@ pub enum Message {
         from_node: EndpointId,
         timestamp: u64,
     },
+    ClassJoinRequest {
+        invite_id: String,
+        class_id: TopicId,
+        student_node_id: EndpointId,
+        display_name: String,
+        timestamp: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

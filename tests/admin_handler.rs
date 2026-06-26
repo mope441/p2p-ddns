@@ -102,7 +102,7 @@ async fn auth_registers_client_and_query_excludes_client_nodes() -> Result<()> {
     assert!(clients.is_client_node(&id));
     assert!(ctx.nodes.contains_key(&id));
 
-    let outcome = handler::handle_command(&ClientCommand::Query, &ctx, &clients, None).await;
+    let outcome = handler::handle_command(&ClientCommand::Query, &ctx, &clients).await;
     let nodes = match outcome.response {
         ClientResponse::Nodes(nodes) => nodes,
         other => anyhow::bail!("unexpected response: {other:?}"),
@@ -139,7 +139,6 @@ async fn resolve_node_finds_active_daemon_by_domain_or_prefix() -> Result<()> {
         },
         &ctx,
         &clients,
-        None,
     )
     .await;
     let resolved = match outcome.response {
@@ -156,7 +155,6 @@ async fn resolve_node_finds_active_daemon_by_domain_or_prefix() -> Result<()> {
         },
         &ctx,
         &clients,
-        None,
     )
     .await;
     let resolved = match outcome.response {
@@ -197,7 +195,6 @@ async fn resolve_node_excludes_registered_clients() -> Result<()> {
         },
         &ctx,
         &clients,
-        None,
     )
     .await;
 
@@ -210,7 +207,7 @@ async fn resolve_node_excludes_registered_clients() -> Result<()> {
 async fn shutdown_maps_to_action_in_handler() -> Result<()> {
     let (ctx, clients) = make_context().await?;
 
-    let outcome = handler::handle_command(&ClientCommand::Shutdown, &ctx, &clients, None).await;
+    let outcome = handler::handle_command(&ClientCommand::Shutdown, &ctx, &clients).await;
     assert!(matches!(
         outcome.action,
         Some(handler::AdminAction::Shutdown)
@@ -222,8 +219,8 @@ async fn shutdown_maps_to_action_in_handler() -> Result<()> {
 async fn pause_and_resume_affect_status() -> Result<()> {
     let (ctx, clients) = make_context().await?;
 
-    let _ = handler::handle_command(&ClientCommand::Pause, &ctx, &clients, None).await;
-    let status = match handler::handle_command(&ClientCommand::Status, &ctx, &clients, None)
+    let _ = handler::handle_command(&ClientCommand::Pause, &ctx, &clients).await;
+    let status = match handler::handle_command(&ClientCommand::Status, &ctx, &clients)
         .await
         .response
     {
@@ -234,8 +231,8 @@ async fn pause_and_resume_affect_status() -> Result<()> {
     assert!(status.hosts_sync.enabled);
     assert!(status.hosts_sync.path.is_some());
 
-    let _ = handler::handle_command(&ClientCommand::Resume, &ctx, &clients, None).await;
-    let status = match handler::handle_command(&ClientCommand::Status, &ctx, &clients, None)
+    let _ = handler::handle_command(&ClientCommand::Resume, &ctx, &clients).await;
+    let status = match handler::handle_command(&ClientCommand::Status, &ctx, &clients)
         .await
         .response
     {
@@ -264,7 +261,7 @@ async fn add_node_and_remove_node_persist_and_update_state() -> Result<()> {
     };
 
     let ticket = Ticket::new(Some(ctx.ticket.topic()), node).to_string();
-    let outcome = handler::handle_command(&ClientCommand::AddNode { ticket }, &ctx, &clients, None).await;
+    let outcome = handler::handle_command(&ClientCommand::AddNode { ticket }, &ctx, &clients).await;
     assert!(matches!(outcome.response, ClientResponse::Ack(_)));
     assert!(ctx.nodes.contains_key(&pk));
     assert!(ctx.is_node_trusted(&pk));
@@ -273,7 +270,6 @@ async fn add_node_and_remove_node_persist_and_update_state() -> Result<()> {
         &ClientCommand::RemoveNode { id: pk.to_string() },
         &ctx,
         &clients,
-        None,
     )
     .await;
     assert!(matches!(outcome.response, ClientResponse::Ack(_)));
@@ -300,18 +296,80 @@ async fn remove_node_prefix_can_revoke_inactive_trusted_node() -> Result<()> {
     };
 
     let ticket = Ticket::new(Some(ctx.ticket.topic()), node).to_string();
-    let outcome = handler::handle_command(&ClientCommand::AddNode { ticket }, &ctx, &clients, None).await;
+    let outcome = handler::handle_command(&ClientCommand::AddNode { ticket }, &ctx, &clients).await;
     assert!(matches!(outcome.response, ClientResponse::Ack(_)));
     assert!(ctx.is_node_trusted(&pk));
 
     ctx.nodes.remove(&pk);
     let prefix = pk.to_string().chars().take(12).collect::<String>();
     let outcome =
-        handler::handle_command(&ClientCommand::RemoveNode { id: prefix }, &ctx, &clients, None).await;
+        handler::handle_command(&ClientCommand::RemoveNode { id: prefix }, &ctx, &clients).await;
 
     assert!(matches!(outcome.response, ClientResponse::Ack(_)));
     assert!(!ctx.nodes.contains_key(&pk));
     assert!(!ctx.is_node_trusted(&pk));
 
+    Ok(())
+}
+
+// ── Bug fix tests ─────────────────────────────────────────
+
+#[tokio::test]
+async fn test_class_create_creates_teacher_member_bug1() -> Result<()> {
+    let dir = tempdir()?;
+    let args = DaemonArgs {
+        daemon: true,
+        primary: true,
+        domain: Some("teacher".to_string()),
+        config: Some(dir.path().to_path_buf()),
+        bind: Some("127.0.0.1:0".to_string()),
+        no_mdns: true,
+        dht: false,
+        hosts_sync: false,
+        ..DaemonArgs::default()
+    };
+    DaemonArgs::validate(&args)?;
+    let storage = Storage::new(dir.path().join("db"))?;
+    let (ctx, _gos, _sp) = init_network(args, storage).await?;
+    let clients = ClientRegistry::new();
+
+    let outcome = handler::handle_command(
+        &ClientCommand::ClassCreate {
+            class_name: "Test".to_string(),
+        },
+        &ctx,
+        &clients,
+    )
+    .await;
+
+    assert!(matches!(outcome.response, ClientResponse::ClassCreated(_)));
+    let member = ctx.class_store.load_member(&ctx.me.node_id).unwrap();
+    assert!(member.is_some());
+    let member = member.unwrap();
+    assert_eq!(member.role, p2p_ddns::domain::node::NodeRole::Teacher);
+    assert_eq!(
+        member.status,
+        p2p_ddns::class_network::model::MemberStatus::Approved
+    );
+    Ok(())
+}
+
+#[test]
+fn test_old_node_data_deserialization_bug6() -> Result<()> {
+    let mut rng = rand::rng();
+    let pk = SecretKey::generate(&mut rng).public();
+    let node = Node {
+        node_id: pk,
+        invitor: pk,
+        addr: iroh::EndpointAddr::new(pk),
+        domain: "test".to_string(),
+        services: Default::default(),
+        last_heartbeat: 1,
+        role: None,
+    };
+    let bytes = postcard::to_allocvec(&node)?;
+    let loaded: Node = postcard::from_bytes(&bytes)?;
+    assert_eq!(loaded.node_id, node.node_id);
+    assert!(loaded.role.is_none());
     Ok(())
 }

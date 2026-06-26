@@ -1186,6 +1186,90 @@ impl Context {
                 }
             }
 
+            Message::ClassText {
+                id,
+                from_node,
+                text,
+                timestamp: _,
+            } => {
+                log::info!(
+                    "ClassText from {}: {} (id={})",
+                    from_node,
+                    &text[..text.len().min(80)],
+                    id
+                );
+            }
+            Message::ClassAck {
+                message_id,
+                from_node,
+                timestamp: _,
+            } => {
+                log::info!("ClassAck for {} from {}", message_id, from_node);
+            }
+            Message::ClassJoinRequest {
+                invite_id,
+                class_id: _,
+                student_node_id,
+                display_name,
+                timestamp: _,
+            } => {
+                log::info!(
+                    "ClassJoinRequest: invite={} student={} name={}",
+                    invite_id,
+                    student_node_id,
+                    display_name
+                );
+
+                // Teacher side: validate invite and create pending ClassMember
+                let now = crate::util::time_now();
+                let _pending = match self.class_store.load_pending_invite(&invite_id) {
+                    Ok(Some(p)) => {
+                        if now > p.expires_at {
+                            log::warn!("Join request with expired invite: {}", invite_id);
+                            return;
+                        }
+                        p
+                    }
+                    Ok(None) => {
+                        log::warn!("Join request with unknown invite: {}", invite_id);
+                        return;
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load pending invite: {}", e);
+                        return;
+                    }
+                };
+
+                let class_member = crate::class_network::model::ClassMember {
+                    node_id: student_node_id,
+                    display_name: display_name.clone(),
+                    role: crate::domain::node::NodeRole::Student,
+                    status: crate::class_network::model::MemberStatus::Pending,
+                    groups: vec![],
+                    joined_at: now,
+                };
+
+                if let Err(e) = self.class_store.save_member(&class_member) {
+                    log::error!("Failed to save student member: {}", e);
+                    return;
+                }
+
+                let _ = self.class_store.delete_pending_invite(&invite_id);
+
+                self.class_store.audit(
+                    &display_name,
+                    "class.join",
+                    &student_node_id.to_string(),
+                    "ok",
+                );
+
+                log::info!(
+                    "Student {} ({}) added as pending member",
+                    display_name,
+                    student_node_id
+                );
+            }
+
             #[allow(unreachable_patterns)]
             _ => log::warn!("Unknown message received"),
         }

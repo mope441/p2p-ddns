@@ -295,8 +295,7 @@ async fn handle_client_connection(
                 continue;
             }
 
-            let outcome =
-                handler::handle_command(&cmd, &ctx, &clients, Some(pk)).await;
+            let outcome = handler::handle_command(&cmd, &ctx, &clients).await;
 
             if let Err(e) = send_message(&mut stream, &outcome.response).await {
                 error!("Failed to send response: {}", e);

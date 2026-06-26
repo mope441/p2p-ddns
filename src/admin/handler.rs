@@ -239,18 +239,14 @@ fn uuid_v4() -> String {
     )
 }
 
-fn require_teacher(
-    ctx: &Context,
-    client_id: Option<EndpointId>,
-) -> std::result::Result<(), String> {
-    let id = client_id.ok_or("Authentication required")?;
+fn require_teacher_daemon(ctx: &Context) -> std::result::Result<(), String> {
     let member = ctx
         .class_store
-        .load_member(&id)
+        .load_member(&ctx.me.node_id)
         .map_err(|e| format!("{e}"))?
         .ok_or("Not a class member")?;
-    if member.role != NodeRole::Teacher {
-        return Err("Only teachers can perform this action".into());
+    if member.role != NodeRole::Teacher || member.status != MemberStatus::Approved {
+        return Err("Only approved teachers can perform this action".into());
     }
     Ok(())
 }
@@ -259,7 +255,6 @@ pub async fn handle_command(
     cmd: &ClientCommand,
     ctx: &Context,
     clients: &ClientRegistry,
-    client_id: Option<EndpointId>,
 ) -> CommandOutcome {
     match cmd {
         ClientCommand::Query => {
@@ -453,12 +448,6 @@ pub async fn handle_command(
             action: Some(AdminAction::Shutdown),
         },
         ClientCommand::ClassCreate { class_name } => {
-            if let Err(e) = require_teacher(ctx, client_id) {
-                return CommandOutcome {
-                    response: ClientResponse::Error(e),
-                    action: None,
-                };
-            }
             if !ctx.args.primary {
                 return CommandOutcome {
                     response: ClientResponse::Error(
@@ -516,12 +505,8 @@ pub async fn handle_command(
                 };
             }
 
-            ctx.class_store.audit(
-                &ctx.me.domain,
-                "class.create",
-                &network.class_name,
-                "ok",
-            );
+            ctx.class_store
+                .audit(&ctx.me.domain, "class.create", &network.class_name, "ok");
 
             CommandOutcome {
                 response: ClientResponse::ClassCreated(network),
@@ -566,7 +551,7 @@ pub async fn handle_command(
             display_name,
             expires_secs,
         } => {
-            if let Err(e) = require_teacher(ctx, client_id) {
+            if let Err(e) = require_teacher_daemon(ctx) {
                 return CommandOutcome {
                     response: ClientResponse::Error(e),
                     action: None,
@@ -611,6 +596,7 @@ pub async fn handle_command(
                 p2p_ticket: ctx.ticket.to_string(),
                 transport_port: 39091,
                 shared_secret: shared_secret.clone(),
+                display_name: display_name.clone(),
                 expires_at: now + expires,
             };
 
@@ -655,33 +641,16 @@ pub async fn handle_command(
                 }
             };
 
-            // Validate invite exists and is not expired
+            // Validate expiry
             let now = util::time_now();
-            let pending = match ctx.class_store.load_pending_invite(&join_ticket.invite_id) {
-                Ok(Some(p)) => {
-                    if now > p.expires_at {
-                        return CommandOutcome {
-                            response: ClientResponse::Error("Invite has expired".to_string()),
-                            action: None,
-                        };
-                    }
-                    p
-                }
-                Ok(None) => {
-                    return CommandOutcome {
-                        response: ClientResponse::Error("Unknown invite ID".to_string()),
-                        action: None,
-                    };
-                }
-                Err(e) => {
-                    return CommandOutcome {
-                        response: ClientResponse::Error(format!("Failed to load invite: {e}")),
-                        action: None,
-                    };
-                }
-            };
+            if now > join_ticket.expires_at {
+                return CommandOutcome {
+                    response: ClientResponse::Error("Invite has expired".to_string()),
+                    action: None,
+                };
+            }
 
-            // Parse P2P ticket and add node to network
+            // Parse P2P ticket to get teacher node info
             let ticket: Ticket = match join_ticket.p2p_ticket.parse() {
                 Ok(t) => t,
                 Err(e) => {
@@ -692,30 +661,23 @@ pub async fn handle_command(
                 }
             };
 
-            let (topic, _rnum, node) = ticket.flatten();
-            if topic != ctx.ticket.topic() {
-                return CommandOutcome {
-                    response: ClientResponse::Error(
-                        "P2P ticket topic does not match this network".to_string(),
-                    ),
-                    action: None,
-                };
-            }
+            let (_topic, _rnum, teacher_node) = ticket.flatten();
+            let teacher_node_id = teacher_node.node_id;
 
-            let student_node_id = node.node_id;
-            ctx.trust_daemon_node(&node);
-            ctx.upsert_active_node(node.clone());
-            if let Err(e) = ctx.storage.save_node(&node) {
+            // Trust teacher node
+            ctx.trust_daemon_node(&teacher_node);
+            ctx.upsert_active_node(teacher_node.clone());
+            if let Err(e) = ctx.storage.save_node(&teacher_node) {
                 return CommandOutcome {
                     response: ClientResponse::Error(format!("Failed to persist node: {e}")),
                     action: None,
                 };
             }
 
-            // Store shared_secret in config
+            // Store shared_secret and class metadata locally
             if let Err(e) = ctx.storage.save_config::<Vec<u8>, Vec<u8>>(
-                &format!("shared_secret_{}", student_node_id),
-                pending.shared_secret.as_bytes().to_vec(),
+                &format!("shared_secret_{}", teacher_node_id),
+                join_ticket.shared_secret.as_bytes().to_vec(),
             ) {
                 return CommandOutcome {
                     response: ClientResponse::Error(format!("Failed to save secret: {e}")),
@@ -723,41 +685,43 @@ pub async fn handle_command(
                 };
             }
 
-            // Create student ClassMember (status=Pending)
-            let class_member = ClassMember {
-                node_id: student_node_id,
-                display_name: pending.display_name.clone(),
-                role: NodeRole::Student,
-                status: MemberStatus::Pending,
-                groups: vec![],
-                joined_at: now,
-            };
-
-            if let Err(e) = ctx.class_store.save_member(&class_member) {
-                return CommandOutcome {
-                    response: ClientResponse::Error(format!("Failed to save member: {e}")),
-                    action: None,
-                };
-            }
-
-            // Delete consumed invite
-            let _ = ctx
-                .class_store
-                .delete_pending_invite(&join_ticket.invite_id);
-
-            ctx.class_store.audit(
-                &pending.display_name,
-                "class.join",
-                &student_node_id.to_string(),
-                "ok",
+            // Save class metadata for this student
+            let _ = ctx.storage.save_config::<Vec<u8>, Vec<u8>>(
+                "class_id",
+                join_ticket.class_id.to_string().as_bytes().to_vec(),
+            );
+            let _ = ctx.storage.save_config::<Vec<u8>, Vec<u8>>(
+                "class_name",
+                join_ticket.class_name.as_bytes().to_vec(),
+            );
+            let _ = ctx.storage.save_config::<Vec<u8>, Vec<u8>>(
+                "teacher_node_id",
+                teacher_node_id.to_string().as_bytes().to_vec(),
             );
 
-            CommandOutcome {
-                response: ClientResponse::JoinRequested(format!(
-                    "Join request submitted for '{}'. Waiting for teacher approval.",
-                    pending.display_name
-                )),
-                action: None,
+            // Send ClassJoinRequest to teacher via P2P
+            let join_request = crate::domain::message::Message::ClassJoinRequest {
+                invite_id: join_ticket.invite_id.clone(),
+                class_id: join_ticket.class_id,
+                student_node_id: ctx.me.node_id,
+                display_name: join_ticket.display_name.clone(),
+                timestamp: now,
+            };
+
+            match ctx.send_message_to(&teacher_node_id, join_request).await {
+                Ok(_) => CommandOutcome {
+                    response: ClientResponse::JoinRequested(format!(
+                        "Join request sent to teacher for '{}'. Waiting for approval.",
+                        join_ticket.display_name
+                    )),
+                    action: None,
+                },
+                Err(e) => CommandOutcome {
+                    response: ClientResponse::Error(format!(
+                        "Failed to send join request to teacher: {e}"
+                    )),
+                    action: None,
+                },
             }
         }
         ClientCommand::ClassJoinRequestsList => {
@@ -776,7 +740,7 @@ pub async fn handle_command(
             }
         }
         ClientCommand::ClassJoinRequestApprove { node_id } => {
-            if let Err(e) = require_teacher(ctx, client_id) {
+            if let Err(e) = require_teacher_daemon(ctx) {
                 return CommandOutcome {
                     response: ClientResponse::Error(e),
                     action: None,
@@ -835,7 +799,7 @@ pub async fn handle_command(
             }
         }
         ClientCommand::ClassJoinRequestDeny { node_id } => {
-            if let Err(e) = require_teacher(ctx, client_id) {
+            if let Err(e) = require_teacher_daemon(ctx) {
                 return CommandOutcome {
                     response: ClientResponse::Error(e),
                     action: None,
@@ -899,7 +863,7 @@ pub async fn handle_command(
             }
         }
         ClientCommand::ClassGroupCreate { group_name } => {
-            if let Err(e) = require_teacher(ctx, client_id) {
+            if let Err(e) = require_teacher_daemon(ctx) {
                 return CommandOutcome {
                     response: ClientResponse::Error(e),
                     action: None,
@@ -944,6 +908,12 @@ pub async fn handle_command(
             }
         }
         ClientCommand::ClassGroupAddMember { group_id, node_id } => {
+            if let Err(e) = require_teacher_daemon(ctx) {
+                return CommandOutcome {
+                    response: ClientResponse::Error(e),
+                    action: None,
+                };
+            }
             let node_id_parsed: EndpointId = match node_id.parse() {
                 Ok(id) => id,
                 Err(e) => {
@@ -1016,6 +986,12 @@ pub async fn handle_command(
             }
         }
         ClientCommand::ClassGroupRemoveMember { group_id, node_id } => {
+            if let Err(e) = require_teacher_daemon(ctx) {
+                return CommandOutcome {
+                    response: ClientResponse::Error(e),
+                    action: None,
+                };
+            }
             let node_id_parsed: EndpointId = match node_id.parse() {
                 Ok(id) => id,
                 Err(e) => {
@@ -1107,7 +1083,7 @@ pub async fn handle_command(
             }
         }
         ClientCommand::ClassGroupDelete { group_id } => {
-            if let Err(e) = require_teacher(ctx, client_id) {
+            if let Err(e) = require_teacher_daemon(ctx) {
                 return CommandOutcome {
                     response: ClientResponse::Error(e),
                     action: None,
@@ -1150,7 +1126,7 @@ pub async fn handle_command(
             }
         }
         ClientCommand::ClassBroadcast { message } => {
-            if let Err(e) = require_teacher(ctx, client_id) {
+            if let Err(e) = require_teacher_daemon(ctx) {
                 return CommandOutcome {
                     response: ClientResponse::Error(e),
                     action: None,
@@ -1204,6 +1180,7 @@ pub async fn handle_command(
 
             CommandOutcome {
                 response: ClientResponse::BroadcastResult {
+                    message_id: msg_id,
                     total: members.len(),
                     sent,
                     failed,
@@ -1213,6 +1190,12 @@ pub async fn handle_command(
             }
         }
         ClientCommand::ClassMulticast { group_id, message } => {
+            if let Err(e) = require_teacher_daemon(ctx) {
+                return CommandOutcome {
+                    response: ClientResponse::Error(e),
+                    action: None,
+                };
+            }
             let group = match ctx.class_store.load_group(group_id) {
                 Ok(Some(g)) => g,
                 Ok(None) => {
@@ -1258,6 +1241,7 @@ pub async fn handle_command(
 
             CommandOutcome {
                 response: ClientResponse::BroadcastResult {
+                    message_id: msg_id,
                     total,
                     sent,
                     failed,
@@ -1266,98 +1250,31 @@ pub async fn handle_command(
                 action: None,
             }
         }
-        ClientCommand::ClassMessageStatus { message_id } => {
-            match ctx.class_store.load_outbox_record(message_id) {
-                Ok(Some(record)) => {
-                    let json = serde_json::json!({
-                        "message_id": record.message_id,
-                        "status": format!("{:?}", record.status),
-                        "retry_count": record.retry_count,
-                        "max_retries": record.max_retries,
-                        "next_retry_at": record.next_retry_at,
-                        "last_error": record.last_error,
-                    });
-                    CommandOutcome {
-                        response: ClientResponse::MessageStatus(
-                            serde_json::to_string_pretty(&json).unwrap_or_default(),
-                        ),
-                        action: None,
-                    }
-                }
-                Ok(None) => CommandOutcome {
-                    response: ClientResponse::Error("Message not found".to_string()),
-                    action: None,
-                },
-                Err(e) => CommandOutcome {
-                    response: ClientResponse::Error(format!("Failed to load message: {e}")),
-                    action: None,
-                },
-            }
-        }
-        ClientCommand::ClassMessageRetry { message_id } => {
-            let mut record = match ctx.class_store.load_outbox_record(message_id) {
-                Ok(Some(r)) => r,
-                Ok(None) => {
-                    return CommandOutcome {
-                        response: ClientResponse::Error("Message not found".to_string()),
-                        action: None,
-                    };
-                }
-                Err(e) => {
-                    return CommandOutcome {
-                        response: ClientResponse::Error(format!("Failed to load message: {e}")),
-                        action: None,
-                    };
-                }
-            };
-
-            let now = util::time_now();
-            record.next_retry_at = now;
-            record.retry_count = 0;
-            record.status = crate::class_network::messaging::DeliveryStatus::Created;
-            if let Err(e) = ctx.class_store.save_outbox_record(&record) {
+        ClientCommand::ClassMessageStatus { .. } => CommandOutcome {
+            response: ClientResponse::Error(
+                "message status is not implemented in this phase".to_string(),
+            ),
+            action: None,
+        },
+        ClientCommand::ClassMessageRetry { .. } => CommandOutcome {
+            response: ClientResponse::Error(
+                "message retry is not implemented in this phase".to_string(),
+            ),
+            action: None,
+        },
+        ClientCommand::ClassAuditList => CommandOutcome {
+            response: ClientResponse::Error(
+                "audit list is not implemented in this phase".to_string(),
+            ),
+            action: None,
+        },
+        ClientCommand::ClassDirectSend { node_id, message } => {
+            if let Err(e) = require_teacher_daemon(ctx) {
                 return CommandOutcome {
-                    response: ClientResponse::Error(format!("Failed to queue retry: {e}")),
+                    response: ClientResponse::Error(e),
                     action: None,
                 };
             }
-
-            CommandOutcome {
-                response: ClientResponse::Ack(format!(
-                    "Message {} queued for retry",
-                    message_id
-                )),
-                action: None,
-            }
-        }
-        ClientCommand::ClassAuditList => {
-            match ctx.class_store.load_all_audit_events() {
-                Ok(events) => {
-                    let json = serde_json::json!({
-                        "events": events.iter().map(|e| serde_json::json!({
-                            "event_id": e.event_id,
-                            "actor": e.actor,
-                            "action": e.action,
-                            "target": e.target,
-                            "timestamp": e.timestamp,
-                            "result": e.result,
-                        })).collect::<Vec<_>>(),
-                        "count": events.len(),
-                    });
-                    CommandOutcome {
-                        response: ClientResponse::AuditLog(
-                            serde_json::to_string_pretty(&json).unwrap_or_default(),
-                        ),
-                        action: None,
-                    }
-                }
-                Err(e) => CommandOutcome {
-                    response: ClientResponse::Error(format!("Failed to load audit log: {e}")),
-                    action: None,
-                },
-            }
-        }
-        ClientCommand::ClassDirectSend { node_id, message } => {
             let target: EndpointId = match node_id.parse() {
                 Ok(id) => id,
                 Err(e) => {

@@ -265,8 +265,11 @@ impl ClassStore {
         Ok(all
             .into_iter()
             .filter(|r| {
-                matches!(r.status, crate::class_network::messaging::DeliveryStatus::Created | crate::class_network::messaging::DeliveryStatus::Failed)
-                    && r.next_retry_at <= now
+                matches!(
+                    r.status,
+                    crate::class_network::messaging::DeliveryStatus::Created
+                        | crate::class_network::messaging::DeliveryStatus::Failed
+                ) && r.next_retry_at <= now
                     && r.retry_count < r.max_retries
             })
             .collect())

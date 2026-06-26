@@ -128,13 +128,14 @@ pub enum ClientResponse {
     GroupCreated(Group),
     GroupMembers(Vec<ClassMember>),
     BroadcastResult {
+        message_id: String,
         total: usize,
         sent: usize,
         failed: usize,
         failures: Vec<String>,
     },
-    MessageStatus(String),    // JSON status info
-    AuditLog(String),         // JSON audit log
+    MessageStatus(String), // JSON status info
+    AuditLog(String),      // JSON audit log
 }
 
 /// HTTP等无连接场景下的一次性请求封装

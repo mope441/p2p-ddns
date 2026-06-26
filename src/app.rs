@@ -379,13 +379,10 @@ fn spawn_outbox_retry_task(ctx: Arc<crate::net::Context>) {
                 record.next_retry_at = record.compute_next_retry(now);
 
                 if record.retry_count >= record.max_retries {
-                    record.status =
-                        crate::class_network::messaging::DeliveryStatus::Expired;
-                    record.last_error =
-                        Some("Max retries exceeded".to_string());
+                    record.status = crate::class_network::messaging::DeliveryStatus::Expired;
+                    record.last_error = Some("Max retries exceeded".to_string());
                 } else {
-                    record.status =
-                        crate::class_network::messaging::DeliveryStatus::Sent;
+                    record.status = crate::class_network::messaging::DeliveryStatus::Sent;
                 }
 
                 if let Err(e) = ctx.class_store.save_outbox_record(&record) {
@@ -399,6 +396,18 @@ fn spawn_outbox_retry_task(ctx: Arc<crate::net::Context>) {
 pub async fn run_client(args: ClientArgs) -> Result<()> {
     let ticket = args.ticket.clone().or_else(|| get_ticket().ok());
     let auth = build_auth_request(ticket.as_deref()).await?;
+
+    // Extract invite output path before consuming args.command
+    let invite_output = match &args.command {
+        ClientCommandArgs::Class {
+            command:
+                ClassCommand::Invite {
+                    command: ClassInviteCommand::Create { output, .. },
+                },
+        } => output.clone(),
+        _ => None,
+    };
+
     let response = if let Some(bind) = args.admin_http.as_deref() {
         let bind = util::parse_bind_addr(bind)?;
         run_http_client(bind, args.timeout, auth, args.command).await?
@@ -406,6 +415,18 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
         let socket_path = get_socket_path(&args.socket_path);
         run_socket_client(socket_path, args.timeout, auth, args.command).await?
     };
+
+    // Write invite to file if --output was specified
+    if let ClientResponse::InviteCreated(ref json) = response
+        && let Some(path) = &invite_output
+    {
+        if let Err(e) = std::fs::write(path, json) {
+            output::display_error(&format!("Failed to write invite file: {e}"));
+        } else {
+            output::display_info(&format!("Invite written to {}", path));
+        }
+    }
+
     display_response(response, args.json)?;
     Ok(())
 }
@@ -793,7 +814,7 @@ fn to_client_command(command: ClientCommandArgs) -> ClientCommand {
                         ClassInviteCommand::Create {
                             display_name,
                             expires,
-                            ..
+                            output: _,
                         },
                 },
         } => ClientCommand::ClassInviteCreate {
@@ -973,15 +994,16 @@ fn display_response(response: ClientResponse, json: bool) -> Result<()> {
             }
         }
         ClientResponse::BroadcastResult {
+            message_id,
             total,
             sent,
             failed,
             failures,
         } => {
             if json {
-                output::display_broadcast_result_json(total, sent, failed, &failures);
+                output::display_broadcast_result_json(&message_id, total, sent, failed, &failures);
             } else {
-                output::display_broadcast_result(total, sent, failed, &failures);
+                output::display_broadcast_result(&message_id, total, sent, failed, &failures);
             }
         }
     }

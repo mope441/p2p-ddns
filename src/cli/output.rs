@@ -987,8 +987,22 @@ pub fn display_group_members_json(members: &[ClassMember]) {
 
 // ── Broadcast result display ────────────────────────────────
 
-pub fn display_broadcast_result(total: usize, sent: usize, failed: usize, failures: &[String]) {
+pub fn display_broadcast_result(
+    message_id: &str,
+    total: usize,
+    sent: usize,
+    failed: usize,
+    failures: &[String],
+) {
     println!("{}", section_title("Broadcast Result"));
+    println!(
+        "{}",
+        colorize(
+            format!("Message ID: {message_id}"),
+            Some(Color::Grey),
+            false
+        )
+    );
     println!(
         "{}",
         colorize(format!("Total: {total}"), Some(Color::Grey), true)
@@ -1026,12 +1040,14 @@ pub fn display_broadcast_result(total: usize, sent: usize, failed: usize, failur
 }
 
 pub fn display_broadcast_result_json(
+    message_id: &str,
     total: usize,
     sent: usize,
     failed: usize,
     failures: &[String],
 ) {
     let output = serde_json::json!({
+        "message_id": message_id,
         "ok": failed == 0,
         "total": total,
         "sent": sent,
